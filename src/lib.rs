@@ -1,85 +1,49 @@
 #![feature(allocator_api)]
 #![feature(vec_into_raw_parts)]
 #![warn(clippy::pedantic)]
+#![allow(incomplete_features)]
+#![feature(adt_const_params)]
 
 //! An extremely unsafe experiment in writing a custom allocator to use linux shared memory.
 
 use std::alloc::{AllocError, Layout};
-use std::collections::HashMap;
-use std::io::{Read, Seek, Write};
+use std::io::{Read, Write};
 use std::mem::MaybeUninit;
-use std::ops::Range;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
-const COUNTER_SUFFIX: &str = "_count";
-type Space = Range<usize>;
-
-// Contains data with infomation regarding state of the shared memory
-struct SharedMemoryDescription {
-    id: String,
-    // Overall address space
-    address_space: Space,
-    // Free memory spaces
-    free: Vec<Space>,
+struct InMemoryDescription {
+    count: AtomicU8,
+    capacity: usize,
+    length: RwLock<usize>,
 }
-impl SharedMemoryDescription {
-    fn new(address_space: Space, id: &str) -> Self {
-        let temp = address_space.clone();
-        Self {
-            id: String::from(id),
-            address_space,
-            free: vec![temp],
-        }
-    }
-}
-impl Drop for SharedMemoryDescription {
-    fn drop(&mut self) {
-        // Detach shared memory
-        reset_err();
-        let x = unsafe { libc::shmdt(self.address_space.start as *const libc::c_void) };
-        dbg!(x);
-        check_err();
 
-        // De-crement the count of processes accessing this shared memory
-        let mut file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(format!("{}{COUNTER_SUFFIX}", self.id))
-            .unwrap();
-        let mut count = [u8::default()];
-        file.read_exact(&mut count).unwrap();
-        file.seek(std::io::SeekFrom::Start(0)).unwrap();
-        let new_count = count[0] - 1;
+use std::sync::RwLock;
 
-        // Only 1 process needs to tell the OS to de-allocate the shared memory
-        if new_count == 0 {
-            let mut shmid_file = std::fs::File::open(&self.id).unwrap();
-            let mut buf = [0; std::mem::size_of::<i32>()];
-            shmid_file.read_exact(&mut buf).unwrap();
-            let shmid = i32::from_ne_bytes(buf);
-
-            // De-allocate shared memory
-            reset_err();
-            let x = unsafe { libc::shmctl(shmid, libc::IPC_RMID, std::ptr::null_mut()) };
-            dbg!(x);
-            check_err();
-
-            // Since the second process closes last this one deletes the file
-            std::fs::remove_file(&self.id).unwrap();
-            std::fs::remove_file(format!("{}{COUNTER_SUFFIX}", self.id)).unwrap();
-        } else {
-            file.write_all(&[new_count]).unwrap();
-        }
-    }
-}
 /// An allocator implementing [`std::alloc::Allocator`] which allocates items in linux shared
 /// memory.
 #[derive(Clone)]
-pub struct SharedAllocator(Arc<Mutex<SharedMemoryDescription>>);
+pub struct SharedAllocator(usize);
 
 impl SharedAllocator {
+    /// Since rust doesn't support static members on structs, we do this.
+    #[inline]
+    fn shmptr_map() -> Arc<Mutex<Vec<(String, i32, usize, u8)>>> {
+        static INIT: AtomicBool = AtomicBool::new(false);
+        // Counts instance non-dropped shared allocators in this process pointing to the same shared
+        // memory.
+        // (file, id, ptr, count)
+        static mut SHMPTR_MAP: MaybeUninit<Arc<Mutex<Vec<(String, i32, usize, u8)>>>> =
+            MaybeUninit::uninit();
+        if !INIT.swap(true, Ordering::SeqCst) {
+            unsafe {
+                SHMPTR_MAP.write(Arc::new(Mutex::new(Vec::new())));
+            }
+        }
+        unsafe { SHMPTR_MAP.assume_init_ref() }.clone()
+    }
+
     /// Construct an alloctor storing the shared memory id in a file at `shmid_path`.
     ///
     /// Constructing multiple allocators with the same `shmid_path` will use the same shared memory.
@@ -112,139 +76,150 @@ impl SharedAllocator {
     /// such.
     #[must_use]
     pub fn new(shmid_path: &str, size: usize) -> Self {
-        type MemoryDescriptorMap = HashMap<i32, Arc<Mutex<SharedMemoryDescription>>>;
-        static mut SHARED_MEMORY_DESCRIPTORS: MaybeUninit<Arc<Mutex<MemoryDescriptorMap>>> =
-            MaybeUninit::uninit();
-        static SHARED: AtomicBool = AtomicBool::new(false);
-        let first = !std::path::Path::new(shmid_path).exists();
-        dbg!(first);
-        // If the shared memory id file doesn't exist, this is the first process to use this shared
-        // memory. Thus we must allocate the shared memory.
-        if first {
-            // Allocate shared memory
-            reset_err();
-            let shared_mem_id = unsafe { libc::shmget(libc::IPC_PRIVATE, size, libc::IPC_CREAT) };
-            dbg!(shared_mem_id);
-            check_err();
-            // We simply save the shared memory id to a file for now
-            let mut shmid_file = std::fs::File::create(shmid_path).unwrap();
-            shmid_file.write_all(&shared_mem_id.to_ne_bytes()).unwrap();
+        let map = Self::shmptr_map();
+        let mut guard = map.lock().unwrap();
+        if let Some((_, _, shmptr, count)) = guard.iter_mut().find(|(p, ..)| p == shmid_path) {
+            *count += 1;
+            // Rerturn allocator
+            Self(*shmptr)
+        } else {
+            let first = !std::path::Path::new(shmid_path).exists();
+            dbg!(first);
+            let full_size = size + std::mem::size_of::<InMemoryDescription>();
 
-            // We create a counter (like a counter in an Arc) to keep the shared memory alive as
-            // long as atleast 1 process is using it.
-            let mut count_file =
-                std::fs::File::create(&format!("{shmid_path}{COUNTER_SUFFIX}")).unwrap();
-            count_file.write_all(&1u8.to_ne_bytes()).unwrap();
-        }
+            // If the shared memory id file doesn't exist, this is the first process to use this
+            // shared memory. Thus we must allocate the shared memory.
+            let shmid = if first {
+                // Allocate shared memory
+                reset_err();
+                let shmid = unsafe { libc::shmget(libc::IPC_PRIVATE, full_size, libc::IPC_CREAT) };
+                dbg!(shmid);
+                check_err();
+                // We simply save the shared memory id to a file for now
+                let mut shmid_file = std::fs::File::create(shmid_path).unwrap();
+                shmid_file.write_all(&shmid.to_ne_bytes()).unwrap();
+                shmid
+            } else {
+                // Gets shared memory id
+                let mut shmid_file = std::fs::File::open(shmid_path).unwrap();
+                let mut shmid_bytes = [0; 4];
+                shmid_file.read_exact(&mut shmid_bytes).unwrap();
+                let shmid = i32::from_ne_bytes(shmid_bytes);
+                dbg!(shmid);
+                shmid
+            };
 
-        // Gets shared memory id
-        let mut shmid_file = std::fs::File::open(shmid_path).unwrap();
-        let mut shmid_bytes = [0; 4];
-        shmid_file.read_exact(&mut shmid_bytes).unwrap();
-        // dbg!(shmid_bytes);
-        let shmid = i32::from_ne_bytes(shmid_bytes);
-        dbg!(shmid);
-
-        // If first shared allocator
-        if SHARED.swap(true, Ordering::SeqCst) {
-            unsafe {
-                SHARED_MEMORY_DESCRIPTORS.write(Arc::new(Mutex::new(HashMap::new())));
-            }
-        }
-
-        let map_ref = unsafe { SHARED_MEMORY_DESCRIPTORS.assume_init_mut() };
-        let mut guard = map_ref.lock().unwrap();
-        // If a shared memory description was found, simply create the allocator pointing to this
-        // shared memory.
-        if let Some(shared_memory_description) = guard.get(&shmid) {
-            Self(shared_memory_description.clone())
-        }
-        // If the map of memory descriptions doesn't contain one for this shared memory id this is
-        // the first `SharedAllocator` instance created for this process, and the first time we are
-        // trying to access this shared memory.
-        // Thus here we want to attach the shared memory to this process (creating the shared memory
-        // desription as we do this).
-        else {
             // Attach shared memory
             reset_err();
             let shared_mem_ptr = unsafe { libc::shmat(shmid, std::ptr::null(), 0) };
             dbg!(shared_mem_ptr);
             check_err();
-            let addr = shared_mem_ptr as usize;
-            // Create memory desicrption
-            let shared_memory_description = Arc::new(Mutex::new(SharedMemoryDescription::new(
-                addr..addr + size,
-                shmid_path,
-            )));
-            guard.insert(shmid, shared_memory_description.clone());
-            // Return allocator
-            Self(shared_memory_description)
+
+            // If first allocator for this shared memory, create memory description, else increment
+            // proccess count
+            if first {
+                // Create in-memory memory description
+                unsafe {
+                    std::ptr::write(
+                        shared_mem_ptr.cast::<InMemoryDescription>(),
+                        InMemoryDescription {
+                            count: AtomicU8::new(1),
+                            capacity: size,
+                            length: RwLock::new(0usize),
+                        },
+                    );
+                }
+            } else {
+                // Increment process count
+                unsafe {
+                    (*shared_mem_ptr.cast::<InMemoryDescription>())
+                        .count
+                        .fetch_add(1, Ordering::SeqCst);
+                }
+            }
+
+            // Update allocator map and drop guard
+            guard.push((shmid_path.to_string(), shmid, shared_mem_ptr as usize, 1));
+            // Rerturn allocator
+            Self(shared_mem_ptr as usize)
+        }
+    }
+}
+impl Drop for SharedAllocator {
+    fn drop(&mut self) {
+        let map = Self::shmptr_map();
+        let mut guard = map.lock().unwrap();
+
+        let index = guard
+            .iter()
+            .enumerate()
+            .find_map(|(i, (_, _, ptr, _))| if *ptr == self.0 { Some(i) } else { None })
+            .unwrap();
+        // Decrement number of allocators in this process
+        guard[index].2 -= 1;
+        // If last allocator in this process
+        let last_process_allocator = guard[index].2 == 0;
+        if last_process_allocator {
+            // Detach shared memory
+            reset_err();
+            let x = unsafe { libc::shmdt(self.0 as *const libc::c_void) };
+            dbg!(x);
+            check_err();
+
+            let description = unsafe { &*(self.0 as *mut InMemoryDescription) };
+            // Decrement number of processes with allocators
+            let last_global_allocator = description.count.fetch_sub(1, Ordering::SeqCst) == 1;
+            if last_global_allocator {
+                // De-allocate shared memory
+                reset_err();
+                let x =
+                    unsafe { libc::shmctl(guard[index].1, libc::IPC_RMID, std::ptr::null_mut()) };
+                dbg!(x);
+                check_err();
+
+                // Since the second process closes last this one deletes the file
+                std::fs::remove_file(&guard[index].0).unwrap();
+            }
         }
     }
 }
 
 unsafe impl std::alloc::Allocator for SharedAllocator {
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
-        let mut guard = self.0.lock().unwrap();
+        // To allocate memory we need a write lock to the length
+        let description = unsafe { &*(self.0 as *mut InMemoryDescription) };
+        let mut guard = description.length.write().unwrap();
 
-        // We find free space large enough
-        let space_opt = guard
-            .free
-            .iter_mut()
-            .find(|space| (space.end - space.start) >= layout.size());
-        let space = match space_opt {
-            Some(x) => x,
-            // In the future when a space cannot be found of this size we should defragment the
-            // address space to produce a large enough contgious space, after this we should attempt
-            // to allocate more shared memory
-            None => unimplemented!(),
-        };
-        // We shrink the space
-        assert!(space.end >= space.start + layout.size());
-        let addr = space.start;
-        space.start += layout.size();
-
-        // We alloc the required memory
-        let ptr = addr as *mut u8;
-        let nonnull_ptr = unsafe {
-            NonNull::new_unchecked(std::ptr::slice_from_raw_parts_mut(ptr, layout.size()))
-        };
-        Ok(nonnull_ptr)
+        if description.capacity - *guard > layout.size() {
+            // Alloc memory
+            let ptr = *guard as *mut u8;
+            let nonnull_ptr = unsafe {
+                NonNull::new_unchecked(std::ptr::slice_from_raw_parts_mut(ptr, layout.size()))
+            };
+            // Increase allocated length
+            *guard += layout.size();
+            // Return pointer
+            Ok(nonnull_ptr)
+        } else {
+            // TODO Make this `AllocError`
+            panic!("can't fit")
+        }
     }
 
     #[allow(clippy::significant_drop_in_scrutinee)]
     unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
-        let mut guard = self.0.lock().unwrap();
+        // To de-allocate memory we need a write lock to the length
+        let description = &*(self.0 as *mut InMemoryDescription);
+        let mut guard = description.length.write().unwrap();
 
-        let start = ptr.as_ptr() as usize;
-        let end = start + layout.size();
-
-        if guard.free[0].start >= end {
-            if guard.free[0].end == start {
-                guard.free[0].start = start;
-            } else {
-                guard.free.insert(0, start..end);
-            }
-        }
-        for i in 1..guard.free.len() {
-            if guard.free[i].start >= end {
-                match (guard.free[i - 1].end == start, guard.free[i].start == end) {
-                    (true, true) => {
-                        guard.free[i - 1].end = guard.free[i].end;
-                        guard.free.remove(i);
-                    }
-                    (true, false) => {
-                        guard.free[i - 1].end = end;
-                    }
-                    (false, true) => {
-                        guard.free[i].start = start;
-                    }
-                    (false, false) => {
-                        guard.free.insert(i, start..end);
-                    }
-                }
-            }
-        }
+        // Shifts all data after the deallcoated item down the memory space by the size of the
+        // deallocated item.
+        let end = ptr.as_ptr().add(layout.size());
+        let following_len = *guard - end as usize;
+        let mem_after = std::ptr::slice_from_raw_parts_mut(end, following_len);
+        std::ptr::replace(ptr.as_ptr().cast::<&[u8]>(), &*mem_after);
+        // Decreases the length
+        *guard -= layout.size();
     }
 }
 
