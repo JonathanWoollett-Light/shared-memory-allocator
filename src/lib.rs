@@ -25,17 +25,17 @@ use std::sync::RwLock;
 /// memory.
 #[derive(Clone)]
 pub struct SharedAllocator(usize);
-
+type SharedMemoryData = Vec<(String, i32, usize, u8)>;
 impl SharedAllocator {
     /// Since rust doesn't support static members on structs, we do this.
     #[inline]
-    fn shmptr_map() -> Arc<Mutex<Vec<(String, i32, usize, u8)>>> {
+    fn shmptr_map() -> Arc<Mutex<SharedMemoryData>> {
         static INIT: AtomicBool = AtomicBool::new(false);
         // Counts instance non-dropped shared allocators in this process pointing to the same shared
         // memory.
         // (file, id, ptr, count)
-        static mut SHMPTR_MAP: MaybeUninit<Arc<Mutex<Vec<(String, i32, usize, u8)>>>> =
-            MaybeUninit::uninit();
+
+        static mut SHMPTR_MAP: MaybeUninit<Arc<Mutex<SharedMemoryData>>> = MaybeUninit::uninit();
         if !INIT.swap(true, Ordering::SeqCst) {
             unsafe {
                 SHMPTR_MAP.write(Arc::new(Mutex::new(Vec::new())));
